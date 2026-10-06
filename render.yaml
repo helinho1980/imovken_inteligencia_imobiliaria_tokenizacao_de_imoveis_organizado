@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: imovken-api
+    runtime: node
+    region: virginia
+    plan: starter            # disco persistente exige plano pago
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod
+    startCommand: node server/index.ts
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /var/data/imovken.db
+    disk:
+      name: imovken-data
+      mountPath: /var/data
+      sizeGB: 1
