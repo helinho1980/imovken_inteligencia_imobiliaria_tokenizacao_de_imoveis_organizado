@@ -3,7 +3,14 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
-import siteConfiguration from './.figma/make/site.json'
+   const siteConfiguration = {
+     title: "IMOVKEN — Real Asset Intelligence",
+     language: "pt-BR",
+     description: "Inteligência imobiliária, dados, IA, valuation e tokenização para transformar ativos reais em ativos inteligentes.",
+     robots: { index: true },
+     icons: { icon: "/favicon.svg" },
+     accessibility: { addBypassLinks: false },
+   }
 
 
 // Vite config — https://vitejs.dev/config/
