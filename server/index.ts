@@ -6,9 +6,18 @@ import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto"
 import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 import { db } from "./db.ts"
+import { registerTerritory } from "./territory.ts"
+import { registerValuation } from "./valuation.ts"
+import { registerData } from "./data.ts"
+import { registerMarket } from "./market.ts"
+import { registerPayments } from "./payments.ts"
+import { registerCertificates } from "./certificates.ts"
+import { registerSubscription } from "./subscription.ts"
+import { mail } from "./mail.ts"
+import { LEGAL_VERSIONS, recordConsents, pendingDocs } from "./legal.ts"
 
 const isProd = process.env.NODE_ENV === "production"
-const app = Fastify({ logger: true, trustProxy: true })
+const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 5 * 1024 * 1024 })
 await app.register(cookie)
 
 // ---------- helpers ----------
@@ -39,10 +48,10 @@ function currentUser(req: any) {
   const sid = req.cookies?.sid
   if (!sid) return null
   const row = db.prepare(
-    "SELECT u.id, u.name, u.email, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?",
+    "SELECT u.id, u.name, u.email, u.role, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?",
   ).get(sid) as Row | undefined
   if (!row || row.expires_at < Date.now()) return null
-  return { id: row.id as number, name: row.name as string, email: row.email as string }
+  return { id: row.id as number, name: row.name as string, email: row.email as string, role: row.role as string }
 }
 function startSession(reply: any, userId: number) {
   const sid = randomBytes(32).toString("hex")
@@ -56,25 +65,34 @@ const bad = (reply: any, msg: string, code = 400) => reply.code(code).send({ err
 // ---------- rate limit simples (por IP, em memória) ----------
 const hits = new Map<string, { n: number; t: number }>()
 app.addHook("onRequest", async (req, reply) => {
-  if (req.method !== "POST" || !req.url.startsWith("/api/")) return
+  if (req.method !== "POST" || !req.url.startsWith("/api/") || req.url.startsWith("/api/admin/") || req.url.startsWith("/api/stripe/")) return
   const now = Date.now(), h = hits.get(req.ip)
   if (!h || now - h.t > 60_000) return void hits.set(req.ip, { n: 1, t: now })
   if (++h.n > 20) return bad(reply, "Muitas tentativas. Aguarde um minuto.", 429)
 })
 
 // ---------- rotas ----------
+// Ao publicar uma nova versão, troque este texto aqui e em src/version.ts: o rodapé do site mostra os dois.
+const APP_VERSION = "r9-2026-11-09"
 app.get("/api/health", async () => ({ ok: true }))
+app.get("/api/version", async () => ({ version: APP_VERSION, features: ["valuation", "territory", "multi-layer"] }))
 
+const ROLES = ["entusiasta", "corretor", "investidor", "proprietario", "incorporador", "instituicao"] as const
 const creds = z.object({ email: z.string().email().max(160), password: z.string().min(8).max(200) })
 app.post("/api/auth/register", async (req, reply) => {
-  const p = creds.extend({ name: z.string().min(2).max(120) }).safeParse(req.body)
+  const p = creds.extend({ name: z.string().min(2).max(120), role: z.enum(ROLES).default("entusiasta"), age18: z.literal(true), accept: z.record(z.string()) }).safeParse(req.body)
   if (!p.success) return bad(reply, "Dados inválidos. A senha precisa ter 8+ caracteres.")
+  for (const [doc, v] of Object.entries(LEGAL_VERSIONS)) {
+    if (p.data.accept[doc] !== v) return bad(reply, "É necessário aceitar os Termos, a Política de Privacidade, o Contrato de Adesão e o Aviso de Riscos.")
+  }
   const email = p.data.email.toLowerCase()
   if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email)) return bad(reply, "E-mail já cadastrado.", 409)
-  const r = db.prepare("INSERT INTO users (email, name, password_hash) VALUES (?,?,?)")
-    .run(email, p.data.name, hash(p.data.password))
+  const r = db.prepare("INSERT INTO users (email, name, password_hash, role) VALUES (?,?,?,?)")
+    .run(email, p.data.name, hash(p.data.password), p.data.role)
+  recordConsents(Number(r.lastInsertRowid), req.ip, String(req.headers["user-agent"] ?? ""))
+  mail.welcome(email, p.data.name)
   startSession(reply, Number(r.lastInsertRowid))
-  return { user: { name: p.data.name, email } }
+  return { user: { name: p.data.name, email, role: p.data.role, needsAcceptance: [] } }
 })
 app.post("/api/auth/login", async (req, reply) => {
   const p = creds.safeParse(req.body)
@@ -82,14 +100,28 @@ app.post("/api/auth/login", async (req, reply) => {
   const u = db.prepare("SELECT * FROM users WHERE email = ?").get(p.data.email.toLowerCase()) as Row | undefined
   if (!u || !verify(p.data.password, u.password_hash)) return bad(reply, "E-mail ou senha inválidos.", 401)
   startSession(reply, u.id)
-  return { user: { name: u.name, email: u.email } }
+  return { user: { name: u.name, email: u.email, role: u.role, needsAcceptance: pendingDocs(u.id) } }
 })
 app.post("/api/auth/logout", async (req, reply) => {
   if (req.cookies.sid) db.prepare("DELETE FROM sessions WHERE id = ?").run(req.cookies.sid)
   reply.clearCookie("sid", { path: "/" })
   return { ok: true }
 })
-app.get("/api/auth/me", async (req) => ({ user: currentUser(req) }))
+app.get("/api/auth/me", async (req) => {
+  const u = currentUser(req)
+  return { user: u ? { ...u, needsAcceptance: pendingDocs(u.id) } : null }
+})
+app.post("/api/legal/accept", async (req, reply) => {
+  const u = currentUser(req)
+  if (!u) return bad(reply, "Faça login para aceitar.", 401)
+  const p = z.object({ accept: z.record(z.string()) }).safeParse(req.body)
+  if (!p.success) return bad(reply, "Dados inválidos.")
+  for (const [doc, v] of Object.entries(LEGAL_VERSIONS)) {
+    if (p.data.accept[doc] !== v) return bad(reply, "Aceite todos os documentos na versão vigente.")
+  }
+  recordConsents(u.id, req.ip, String(req.headers["user-agent"] ?? ""))
+  return { ok: true }
+})
 
 const sorts: Record<string, string> = {
   score: "score DESC", value: "value_brl DESC", potential: "potential DESC",
@@ -154,6 +186,14 @@ app.post("/api/contact", async (req, reply) => {
   db.prepare("INSERT INTO contacts (name, email, message) VALUES (?,?,?)").run(p.data.name, p.data.email, p.data.message)
   return reply.code(201).send({ ok: true })
 })
+
+registerTerritory(app)
+registerValuation(app)
+registerData(app)
+registerMarket(app, { currentUser, bad })
+registerPayments(app, { currentUser, bad })
+registerCertificates(app, { currentUser, bad })
+registerSubscription(app, { currentUser, bad })
 
 // ---------- frontend (produção) ----------
 const dist = resolve("dist")
