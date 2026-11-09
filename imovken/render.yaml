@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: imovken-api
+    runtime: node
+    region: virginia
+    plan: free               # plano gratuito: sem disco, o banco recomeça a cada deploy
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod
+    startCommand: node server/index.ts
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_TOKEN
+        sync: false
